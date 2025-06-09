@@ -1,0 +1,386 @@
+(define-constant contract-owner tx-sender)
+(define-constant err-owner-only (err u100))
+(define-constant err-not-found (err u101))
+(define-constant err-unauthorized (err u102))
+(define-constant err-invalid-amount (err u103))
+(define-constant err-already-completed (err u104))
+(define-constant err-insufficient-funds (err u105))
+(define-constant err-invalid-milestone (err u106))
+(define-constant err-remittance-locked (err u107))
+
+(define-data-var next-remittance-id uint u1)
+(define-data-var platform-fee-rate uint u25)
+(define-data-var total-platform-fees uint u0)
+
+(define-map remittances
+  { remittance-id: uint }
+  {
+    sender: principal,
+    recipient: principal,
+    amount: uint,
+    fee: uint,
+    status: (string-ascii 20),
+    milestone-count: uint,
+    completed-milestones: uint,
+    created-at: uint,
+    completed-at: (optional uint)
+  }
+)
+
+(define-map milestones
+  { remittance-id: uint, milestone-index: uint }
+  {
+    description: (string-ascii 100),
+    amount: uint,
+    completed: bool,
+    completed-at: (optional uint)
+  }
+)
+
+(define-map user-balances
+  { user: principal }
+  { balance: uint }
+)
+
+(define-read-only (get-remittance (remittance-id uint))
+  (map-get? remittances { remittance-id: remittance-id })
+)
+
+(define-read-only (get-milestone (remittance-id uint) (milestone-index uint))
+  (map-get? milestones { remittance-id: remittance-id, milestone-index: milestone-index })
+)
+
+(define-read-only (get-user-balance (user principal))
+  (default-to u0 (get balance (map-get? user-balances { user: user })))
+)
+
+(define-read-only (get-platform-fee-rate)
+  (var-get platform-fee-rate)
+)
+
+(define-read-only (get-total-platform-fees)
+  (var-get total-platform-fees)
+)
+
+(define-read-only (calculate-fee (amount uint))
+  (/ (* amount (var-get platform-fee-rate)) u10000)
+)
+
+(define-private (update-user-balance (user principal) (amount uint) (add bool))
+  (begin
+    (if add
+      (map-set user-balances { user: user } { balance: (+ (get-user-balance user) amount) })
+      (map-set user-balances { user: user } { balance: (- (get-user-balance user) amount) })
+    )
+    true
+  )
+)
+
+(define-private (sum-list (amounts (list 10 uint)))
+  (fold + amounts u0)
+)
+
+(define-public (deposit (amount uint))
+  (begin
+    (asserts! (> amount u0) err-invalid-amount)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (update-user-balance tx-sender amount true)
+    (ok amount)
+  )
+)
+
+(define-public (withdraw (amount uint))
+  (begin
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (>= (get-user-balance tx-sender) amount) err-insufficient-funds)
+    (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+    (update-user-balance tx-sender amount false)
+    (ok amount)
+  )
+)
+
+(define-public (create-milestone 
+  (remittance-id uint) 
+  (milestone-index uint) 
+  (description (string-ascii 100)) 
+  (amount uint)
+)
+  (begin
+    (map-set milestones
+      { remittance-id: remittance-id, milestone-index: milestone-index }
+      {
+        description: description,
+        amount: amount,
+        completed: false,
+        completed-at: none
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (create-remittance-step1 
+  (recipient principal) 
+  (amount uint) 
+  (milestone-count uint)
+)
+  (begin
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (> milestone-count u0) err-invalid-milestone)
+    (asserts! (<= milestone-count u10) err-invalid-milestone)
+    
+    (ok (var-get next-remittance-id))
+  )
+)
+
+(define-public (create-remittance-step2
+  (recipient principal)
+  (amount uint)
+  (fee uint)
+  (milestone-count uint)
+)
+  (begin
+    (asserts! (>= (get-user-balance tx-sender) (+ amount fee)) err-insufficient-funds)
+    (update-user-balance tx-sender (+ amount fee) false)
+    (var-set total-platform-fees (+ (var-get total-platform-fees) fee))
+    
+    (map-set remittances
+      { remittance-id: (var-get next-remittance-id) }
+      {
+        sender: tx-sender,
+        recipient: recipient,
+        amount: amount,
+        fee: fee,
+        status: "pending",
+        milestone-count: milestone-count,
+        completed-milestones: u0,
+        created-at: stacks-block-height,
+        completed-at: none
+      }
+    )
+    
+    (var-set next-remittance-id (+ (var-get next-remittance-id) u1))
+    (ok (- (var-get next-remittance-id) u1))
+  )
+)
+
+(define-public (create-simple-remittance
+  (recipient principal)
+  (amount uint)
+  (description1 (string-ascii 100))
+  (amount1 uint)
+  (description2 (string-ascii 100))
+  (amount2 uint)
+)
+  (begin
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (is-eq amount (+ amount1 amount2)) err-invalid-amount)
+    (asserts! (>= (get-user-balance tx-sender) (+ amount (calculate-fee amount))) err-insufficient-funds)
+    
+    (update-user-balance tx-sender (+ amount (calculate-fee amount)) false)
+    (var-set total-platform-fees (+ (var-get total-platform-fees) (calculate-fee amount)))
+    
+    (map-set remittances
+      { remittance-id: (var-get next-remittance-id) }
+      {
+        sender: tx-sender,
+        recipient: recipient,
+        amount: amount,
+        fee: (calculate-fee amount),
+        status: "pending",
+        milestone-count: u2,
+        completed-milestones: u0,
+        created-at: stacks-block-height,
+        completed-at: none
+      }
+    )
+    
+    (map-set milestones
+      { remittance-id: (var-get next-remittance-id), milestone-index: u0 }
+      {
+        description: description1,
+        amount: amount1,
+        completed: false,
+        completed-at: none
+      }
+    )
+    
+    (map-set milestones
+      { remittance-id: (var-get next-remittance-id), milestone-index: u1 }
+      {
+        description: description2,
+        amount: amount2,
+        completed: false,
+        completed-at: none
+      }
+    )
+    
+    (var-set next-remittance-id (+ (var-get next-remittance-id) u1))
+    (ok (- (var-get next-remittance-id) u1))
+  )
+)
+
+(define-public (create-triple-remittance
+  (recipient principal)
+  (amount uint)
+  (description1 (string-ascii 100))
+  (amount1 uint)
+  (description2 (string-ascii 100))
+  (amount2 uint)
+  (description3 (string-ascii 100))
+  (amount3 uint)
+)
+  (begin
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (is-eq amount (+ (+ amount1 amount2) amount3)) err-invalid-amount)
+    (asserts! (>= (get-user-balance tx-sender) (+ amount (calculate-fee amount))) err-insufficient-funds)
+    
+    (update-user-balance tx-sender (+ amount (calculate-fee amount)) false)
+    (var-set total-platform-fees (+ (var-get total-platform-fees) (calculate-fee amount)))
+    
+    (map-set remittances
+      { remittance-id: (var-get next-remittance-id) }
+      {
+        sender: tx-sender,
+        recipient: recipient,
+        amount: amount,
+        fee: (calculate-fee amount),
+        status: "pending",
+        milestone-count: u3,
+        completed-milestones: u0,
+        created-at: stacks-block-height,
+        completed-at: none
+      }
+    )
+    
+    (map-set milestones
+      { remittance-id: (var-get next-remittance-id), milestone-index: u0 }
+      {
+        description: description1,
+        amount: amount1,
+        completed: false,
+        completed-at: none
+      }
+    )
+    
+    (map-set milestones
+      { remittance-id: (var-get next-remittance-id), milestone-index: u1 }
+      {
+        description: description2,
+        amount: amount2,
+        completed: false,
+        completed-at: none
+      }
+    )
+    
+    (map-set milestones
+      { remittance-id: (var-get next-remittance-id), milestone-index: u2 }
+      {
+        description: description3,
+        amount: amount3,
+        completed: false,
+        completed-at: none
+      }
+    )
+    
+    (var-set next-remittance-id (+ (var-get next-remittance-id) u1))
+    (ok (- (var-get next-remittance-id) u1))
+  )
+)
+
+(define-public (complete-milestone (remittance-id uint) (milestone-index uint))
+  (begin
+    (asserts! (is-some (get-remittance remittance-id)) err-not-found)
+    (asserts! (is-some (get-milestone remittance-id milestone-index)) err-not-found)
+    
+    (asserts! (is-eq tx-sender (get recipient (unwrap-panic (get-remittance remittance-id)))) err-unauthorized)
+    (asserts! (is-eq (get status (unwrap-panic (get-remittance remittance-id))) "pending") err-already-completed)
+    (asserts! (not (get completed (unwrap-panic (get-milestone remittance-id milestone-index)))) err-already-completed)
+    
+    (map-set milestones
+      { remittance-id: remittance-id, milestone-index: milestone-index }
+      (merge (unwrap-panic (get-milestone remittance-id milestone-index)) 
+             { completed: true, completed-at: (some stacks-block-height) })
+    )
+    
+    (update-user-balance 
+      (get recipient (unwrap-panic (get-remittance remittance-id))) 
+      (get amount (unwrap-panic (get-milestone remittance-id milestone-index))) 
+      true
+    )
+    
+    (map-set remittances
+      { remittance-id: remittance-id }
+      (merge (unwrap-panic (get-remittance remittance-id)) 
+             { completed-milestones: (+ (get completed-milestones (unwrap-panic (get-remittance remittance-id))) u1) })
+    )
+    
+    (if (is-eq 
+          (+ (get completed-milestones (unwrap-panic (get-remittance remittance-id))) u1)
+          (get milestone-count (unwrap-panic (get-remittance remittance-id))))
+      (map-set remittances
+        { remittance-id: remittance-id }
+        (merge (unwrap-panic (get-remittance remittance-id)) 
+               { 
+                 status: "completed", 
+                 completed-at: (some stacks-block-height),
+                 completed-milestones: (+ (get completed-milestones (unwrap-panic (get-remittance remittance-id))) u1)
+               })
+      )
+      true
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (cancel-remittance (remittance-id uint))
+  (begin
+    (asserts! (is-some (get-remittance remittance-id)) err-not-found)
+    (asserts! (is-eq tx-sender (get sender (unwrap-panic (get-remittance remittance-id)))) err-unauthorized)
+    (asserts! (is-eq (get status (unwrap-panic (get-remittance remittance-id))) "pending") err-already-completed)
+    (asserts! (is-eq (get completed-milestones (unwrap-panic (get-remittance remittance-id))) u0) err-remittance-locked)
+    
+    (update-user-balance (get sender (unwrap-panic (get-remittance remittance-id))) (get amount (unwrap-panic (get-remittance remittance-id))) true)
+    (var-set total-platform-fees (- (var-get total-platform-fees) (get fee (unwrap-panic (get-remittance remittance-id)))))
+    
+    (map-set remittances
+      { remittance-id: remittance-id }
+      (merge (unwrap-panic (get-remittance remittance-id)) { status: "cancelled" })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (set-platform-fee-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (<= new-rate u1000) err-invalid-amount)
+    (var-set platform-fee-rate new-rate)
+    (ok new-rate)
+  )
+)
+
+(define-public (withdraw-platform-fees)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> (var-get total-platform-fees) u0) err-invalid-amount)
+    (try! (as-contract (stx-transfer? (var-get total-platform-fees) tx-sender contract-owner)))
+    (var-set total-platform-fees u0)
+    (ok (var-get total-platform-fees))
+  )
+)
+
+(define-read-only (get-remittance-progress (remittance-id uint))
+  (match (get-remittance remittance-id)
+    remittance
+    (ok {
+      progress: (/ (* (get completed-milestones remittance) u100) (get milestone-count remittance)),
+      completed: (get completed-milestones remittance),
+      total: (get milestone-count remittance),
+      status: (get status remittance)
+    })
+    err-not-found
+  )
+)
