@@ -8,6 +8,14 @@
 (define-constant err-invalid-milestone (err u106))
 (define-constant err-remittance-locked (err u107))
 
+(define-constant err-dispute-exists (err u108))
+(define-constant err-no-dispute (err u109))
+(define-constant err-arbitrator-only (err u110))
+(define-constant err-cannot-dispute (err u111))
+
+(define-data-var contract-arbitrator principal tx-sender)
+(define-data-var dispute-fee uint u100)
+
 (define-data-var next-remittance-id uint u1)
 (define-data-var platform-fee-rate uint u25)
 (define-data-var total-platform-fees uint u0)
@@ -382,5 +390,103 @@
       status: (get status remittance)
     })
     err-not-found
+  )
+)
+
+(define-map remittance-disputes
+  { remittance-id: uint }
+  {
+    disputer: principal,
+    reason: (string-ascii 200),
+    created-at: uint,
+    resolved: bool,
+    resolution: (optional (string-ascii 200)),
+    resolved-at: (optional uint)
+  }
+)
+
+(define-read-only (get-dispute (remittance-id uint))
+  (map-get? remittance-disputes { remittance-id: remittance-id })
+)
+
+(define-read-only (has-active-dispute (remittance-id uint))
+  (match (get-dispute remittance-id)
+    dispute (not (get resolved dispute))
+    false
+  )
+)
+
+(define-public (initiate-dispute (remittance-id uint) (reason (string-ascii 200)))
+  (begin
+    (asserts! (is-some (get-remittance remittance-id)) err-not-found)
+    (asserts! (is-none (get-dispute remittance-id)) err-dispute-exists)
+    
+    (let ((remittance-data (unwrap-panic (get-remittance remittance-id))))
+      (asserts! (is-eq tx-sender (get sender remittance-data)) err-unauthorized)
+      (asserts! (is-eq (get status remittance-data) "pending") err-cannot-dispute)
+      (asserts! (> (get completed-milestones remittance-data) u0) err-cannot-dispute)
+      (asserts! (>= (get-user-balance tx-sender) (var-get dispute-fee)) err-insufficient-funds)
+      
+      (update-user-balance tx-sender (var-get dispute-fee) false)
+      (var-set total-platform-fees (+ (var-get total-platform-fees) (var-get dispute-fee)))
+      
+      (map-set remittance-disputes
+        { remittance-id: remittance-id }
+        {
+          disputer: tx-sender,
+          reason: reason,
+          created-at: stacks-block-height,
+          resolved: false,
+          resolution: none,
+          resolved-at: none
+        }
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+(define-public (resolve-dispute 
+  (remittance-id uint) 
+  (favor-sender bool) 
+  (resolution (string-ascii 200))
+)
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-arbitrator)) err-arbitrator-only)
+    (asserts! (is-some (get-dispute remittance-id)) err-no-dispute)
+    (asserts! (not (get resolved (unwrap-panic (get-dispute remittance-id)))) err-already-completed)
+    
+    (let ((remittance-data (unwrap-panic (get-remittance remittance-id))))
+      (if favor-sender
+        (begin
+          (update-user-balance (get sender remittance-data) (get amount remittance-data) true)
+          (map-set remittances
+            { remittance-id: remittance-id }
+            (merge remittance-data { status: "refunded" })
+          )
+        )
+        (map-set remittances
+          { remittance-id: remittance-id }
+          (merge remittance-data { status: "completed" })
+        )
+      )
+      
+      (map-set remittance-disputes
+        { remittance-id: remittance-id }
+        (merge (unwrap-panic (get-dispute remittance-id))
+               { resolved: true, resolution: (some resolution), resolved-at: (some stacks-block-height) })
+      )
+      
+      (ok favor-sender)
+    )
+  )
+)
+
+(define-public (set-arbitrator (new-arbitrator principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set contract-arbitrator new-arbitrator)
+    (ok new-arbitrator)
   )
 )
