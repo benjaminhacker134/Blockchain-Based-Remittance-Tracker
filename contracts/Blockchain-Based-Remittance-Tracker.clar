@@ -8,6 +8,11 @@
 (define-constant err-invalid-milestone (err u106))
 (define-constant err-remittance-locked (err u107))
 
+(define-constant err-not-expired (err u112))
+(define-constant err-expired (err u113))
+
+(define-data-var default-expiration-blocks uint u144)
+
 (define-constant err-dispute-exists (err u108))
 (define-constant err-no-dispute (err u109))
 (define-constant err-arbitrator-only (err u110))
@@ -31,7 +36,8 @@
     milestone-count: uint,
     completed-milestones: uint,
     created-at: uint,
-    completed-at: (optional uint)
+    completed-at: (optional uint),
+    expires-at: (optional uint)
   }
 )
 
@@ -163,7 +169,8 @@
         milestone-count: milestone-count,
         completed-milestones: u0,
         created-at: stacks-block-height,
-        completed-at: none
+        completed-at: none,
+        expires-at: none
       }
     )
     
@@ -199,7 +206,8 @@
         milestone-count: u2,
         completed-milestones: u0,
         created-at: stacks-block-height,
-        completed-at: none
+        completed-at: none,
+        expires-at: none
       }
     )
     
@@ -257,7 +265,8 @@
         milestone-count: u3,
         completed-milestones: u0,
         created-at: stacks-block-height,
-        completed-at: none
+        completed-at: none,
+        expires-at: none
       }
     )
     
@@ -488,5 +497,114 @@
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
     (var-set contract-arbitrator new-arbitrator)
     (ok new-arbitrator)
+  )
+)
+
+(define-read-only (get-default-expiration-blocks)
+  (var-get default-expiration-blocks)
+)
+
+(define-read-only (is-remittance-expired (remittance-id uint))
+  (match (get-remittance remittance-id)
+    remittance
+    (match (get expires-at remittance)
+      expiry-block (>= stacks-block-height expiry-block)
+      false)
+    false
+  )
+)
+
+(define-read-only (get-expiration-info (remittance-id uint))
+  (match (get-remittance remittance-id)
+    remittance
+    (match (get expires-at remittance)
+      expiry-block
+      (ok {
+        expires-at: expiry-block,
+        current-block: stacks-block-height,
+        blocks-remaining: (if (> expiry-block stacks-block-height)
+                           (- expiry-block stacks-block-height)
+                           u0),
+        is-expired: (>= stacks-block-height expiry-block)
+      })
+      (ok {
+        expires-at: u0,
+        current-block: stacks-block-height,
+        blocks-remaining: u0,
+        is-expired: false
+      }))
+    err-not-found
+  )
+)
+
+(define-public (create-remittance-with-expiration
+  (recipient principal)
+  (amount uint)
+  (milestone-count uint)
+  (expiration-blocks uint)
+)
+  (begin
+    (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (> milestone-count u0) err-invalid-milestone)
+    (asserts! (<= milestone-count u10) err-invalid-milestone)
+    (asserts! (> expiration-blocks u0) err-invalid-amount)
+    (asserts! (>= (get-user-balance tx-sender) (+ amount (calculate-fee amount))) err-insufficient-funds)
+    
+    (update-user-balance tx-sender (+ amount (calculate-fee amount)) false)
+    (var-set total-platform-fees (+ (var-get total-platform-fees) (calculate-fee amount)))
+    
+    (map-set remittances
+      { remittance-id: (var-get next-remittance-id) }
+      {
+        sender: tx-sender,
+        recipient: recipient,
+        amount: amount,
+        fee: (calculate-fee amount),
+        status: "pending",
+        milestone-count: milestone-count,
+        completed-milestones: u0,
+        created-at: stacks-block-height,
+        completed-at: none,
+        expires-at: (some (+ stacks-block-height expiration-blocks))
+      }
+    )
+    
+    (var-set next-remittance-id (+ (var-get next-remittance-id) u1))
+    (ok (- (var-get next-remittance-id) u1))
+  )
+)
+
+(define-public (reclaim-expired-remittance (remittance-id uint))
+  (begin
+    (asserts! (is-some (get-remittance remittance-id)) err-not-found)
+    (let ((remittance-data (unwrap-panic (get-remittance remittance-id))))
+      (asserts! (is-eq tx-sender (get sender remittance-data)) err-unauthorized)
+      (asserts! (is-eq (get status remittance-data) "pending") err-already-completed)
+      (asserts! (is-remittance-expired remittance-id) err-not-expired)
+      
+      (let ((total-amount (get amount remittance-data))
+            (completed-count (get completed-milestones remittance-data))
+            (milestone-count (get milestone-count remittance-data)))
+        (let ((avg-milestone-amount (/ total-amount milestone-count))
+              (paid-amount (* avg-milestone-amount completed-count))
+              (remaining-amount (- total-amount paid-amount)))
+          (update-user-balance (get sender remittance-data) remaining-amount true)
+          (map-set remittances
+            { remittance-id: remittance-id }
+            (merge remittance-data { status: "expired" })
+          )
+          (ok remaining-amount)
+        )
+      )
+    )
+  )
+)
+
+(define-public (set-default-expiration (blocks uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> blocks u0) err-invalid-amount)
+    (var-set default-expiration-blocks blocks)
+    (ok blocks)
   )
 )
